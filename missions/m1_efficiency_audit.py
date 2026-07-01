@@ -10,12 +10,54 @@ from missions._common import load_csv, num, catalog_by_type
 from finops import metrics
 
 
+def _rightsize_recommendation(gpu: dict, catalog: dict) -> dict | None:
+    cur_type = gpu["gpu_type"]
+    cur = catalog[cur_type]
+    current_price = num(cur["on_demand_hr"])
+    required_hbm = gpu["max_mem_used_gb"]
+    observed_bw = gpu["avg_achieved_bw_tbs"]
+
+    candidates = []
+    for gtype, row in catalog.items():
+        price = num(row["on_demand_hr"])
+        hbm = num(row["hbm_gb"])
+        peak_bw = num(row["peak_bw_tbs"])
+        if price >= current_price or hbm < required_hbm or peak_bw < observed_bw:
+            continue
+        candidates.append({
+            "gpu_type": gtype,
+            "on_demand_hr": price,
+            "hbm_gb": hbm,
+            "peak_bw_tbs": peak_bw,
+            "usd_per_gb": price / hbm if hbm else price,
+        })
+
+    if not candidates:
+        return None
+
+    best = min(candidates, key=lambda c: (c["usd_per_gb"], c["on_demand_hr"]))
+    monthly_savings = (current_price - best["on_demand_hr"]) * 24 * 30
+    return {
+        "gpu_id": gpu["gpu_id"],
+        "current_type": cur_type,
+        "recommended_type": best["gpu_type"],
+        "current_usd_per_gb": round(current_price / num(cur["hbm_gb"]), 4),
+        "recommended_usd_per_gb": round(best["usd_per_gb"], 4),
+        "required_hbm_gb": round(required_hbm, 1),
+        "required_bw_tbs": round(observed_bw, 3),
+        "monthly_savings": round(monthly_savings),
+    }
+
+
 def run(verbose: bool = True) -> dict:
     tel = load_csv("gpu_telemetry.csv")
     cat = catalog_by_type()
 
     # per-row MFU/MBU, then aggregate per GPU
-    agg = defaultdict(lambda: {"util": [], "mfu": [], "mbu": [], "type": None, "idle_hours": 0})
+    agg = defaultdict(lambda: {
+        "util": [], "mfu": [], "mbu": [], "bw": [], "mem": [],
+        "type": None, "idle_hours": 0,
+    })
     for r in tel:
         gtype = r["gpu_type"]
         peak_fp16 = num(cat[gtype]["peak_tflops_fp16"])
@@ -27,6 +69,8 @@ def run(verbose: bool = True) -> dict:
         a["util"].append(num(r["gpu_util_pct"]))
         a["mfu"].append(mfu)
         a["mbu"].append(mbu)
+        a["bw"].append(num(r["achieved_bw_tbs"]))
+        a["mem"].append(num(r["mem_used_gb"]))
         if num(r["gpu_util_pct"]) < 10:  # effectively idle this interval (1h)
             a["idle_hours"] += 1
 
@@ -37,10 +81,13 @@ def run(verbose: bool = True) -> dict:
             "gpu_util_pct": round(sum(a["util"]) / len(a["util"]), 1),
             "mfu": round(sum(a["mfu"]) / len(a["mfu"]), 3),
             "mbu": round(sum(a["mbu"]) / len(a["mbu"]), 3),
+            "avg_achieved_bw_tbs": sum(a["bw"]) / len(a["bw"]),
+            "max_mem_used_gb": max(a["mem"]),
             "idle_hours": a["idle_hours"],
         })
 
     lies = metrics.flag_util_lies(summary)
+    rightsize = [rec for rec in (_rightsize_recommendation(l, cat) for l in lies) if rec]
     idle_waste = 0.0
     for s in summary:
         on_demand = num(catalog_by_type()[s["gpu_type"]]["on_demand_hr"])
@@ -52,9 +99,24 @@ def run(verbose: bool = True) -> dict:
         for s in sorted(summary, key=lambda x: x["mfu"]):
             print(f"{s['gpu_id']:14}{s['gpu_type']:7}{s['gpu_util_pct']:>7}{s['mfu']:>7}{s['mbu']:>7}{s['idle_hours']:>8}")
         print(f"\nGPU-Util LIES (util>=90% but MFU<30%): {[l['gpu_id'] for l in lies]}")
+        if rightsize:
+            print("\nMBU-aware right-size candidates:")
+            print(f"{'GPU':14}{'from':7}{'to':7}{'need GB':>9}{'need BW':>9}{'save/mo':>10}")
+            for r in rightsize:
+                print(
+                    f"{r['gpu_id']:14}{r['current_type']:7}{r['recommended_type']:7}"
+                    f"{r['required_hbm_gb']:>9.1f}{r['required_bw_tbs']:>9.3f}"
+                    f"${r['monthly_savings']:>9,}"
+                )
         print(f"Idle waste (1 day): ${idle_waste:,.2f}  ->  ${idle_waste*30:,.0f}/month")
 
-    return {"summary": summary, "lies": lies, "idle_waste_daily": round(idle_waste, 2)}
+    return {
+        "summary": summary,
+        "lies": lies,
+        "rightsize_recommendations": rightsize,
+        "rightsize_monthly_savings": round(sum(r["monthly_savings"] for r in rightsize)),
+        "idle_waste_daily": round(idle_waste, 2),
+    }
 
 
 if __name__ == "__main__":

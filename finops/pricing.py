@@ -52,6 +52,29 @@ def discount_stack(
     return cache_mult * batch_mult
 
 
+def cache_is_worth_it(
+    input_tok: int,
+    cached_in: int,
+    expected_reads: float = 1.0,
+    cache_discount: float = 0.10,
+    write_premium: float = 0.25,
+) -> bool:
+    """Return True when prompt-cache reads clear a simple break-even threshold.
+
+    Some providers charge extra to create/store cache entries. Model that setup
+    cost as `write_premium` times one normal input read, then require enough
+    cached-read savings to pay it back.
+    """
+    if input_tok <= 0 or cached_in <= 0 or expected_reads <= 0:
+        return False
+    cached_frac = min(cached_in, input_tok) / input_tok
+    savings_per_read = max(0.0, 1.0 - cache_discount)
+    if savings_per_read <= 0:
+        return False
+    break_even_frac = write_premium / (savings_per_read * expected_reads)
+    return cached_frac >= break_even_frac
+
+
 def break_even_utilization(discount_frac: float) -> float:
     """Utilization at which a commitment pays off ~= 1 - discount.
 

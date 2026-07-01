@@ -16,6 +16,7 @@ def run(verbose: bool = True) -> dict:
     rows = load_csv("token_usage.csv")
     base_cost = opt_cost = 0.0
     total_tokens = 0
+    cache_accepted = cache_rejected = 0
     for r in rows:
         inp, out = int(num(r["input_tokens"])), int(num(r["output_tokens"]))
         cached = int(num(r["cached_input_tokens"]))
@@ -26,7 +27,12 @@ def run(verbose: bool = True) -> dict:
         base_cost += pricing.request_cost(inp, out, lin, lout)
         # OPTIMIZED: cascade (route_tier), prompt caching, batch API
         pin, pout = MODEL_PRICES[r["route_tier"]]
-        opt_cost += pricing.request_cost(inp, out, pin, pout, cached_in=cached, batch=is_batch)
+        effective_cached = cached if pricing.cache_is_worth_it(inp, cached) else 0
+        if effective_cached:
+            cache_accepted += 1
+        elif cached:
+            cache_rejected += 1
+        opt_cost += pricing.request_cost(inp, out, pin, pout, cached_in=effective_cached, batch=is_batch)
 
     base_pm = pricing.dollars_per_million(base_cost, total_tokens)
     opt_pm = pricing.dollars_per_million(opt_cost, total_tokens)
@@ -38,12 +44,14 @@ def run(verbose: bool = True) -> dict:
         print(f"baseline  : ${base_cost:,.2f}/day   ${base_pm:.3f}/1M-token")
         print(f"optimized : ${opt_cost:,.2f}/day   ${opt_pm:.3f}/1M-token")
         print(f"savings   : {savings_pct:.1f}%  (cascade + caching + batch)")
+        print(f"cache reads counted: {cache_accepted:,}  skipped below break-even: {cache_rejected:,}")
         print(f"discount stack (batch + 100% cache): {pricing.discount_stack(batch=True, cache_hit_frac=1.0):.3f} of naive")
 
     return {
         "baseline_daily": round(base_cost, 2), "optimized_daily": round(opt_cost, 2),
         "baseline_per_m": round(base_pm, 3), "optimized_per_m": round(opt_pm, 3),
         "savings_pct": round(savings_pct, 1), "total_tokens": total_tokens,
+        "cache_accepted": cache_accepted, "cache_rejected": cache_rejected,
     }
 
 
